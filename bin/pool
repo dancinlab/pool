@@ -1,0 +1,1024 @@
+#!/usr/bin/env python3
+"""pool — minimal host roster + remote exec.
+
+State file: ~/.pool/pool.json
+  { "hosts": [ {"name": "<id>", "ssh": "<user@host>"}, ... ] }
+
+pi5-akida is anima-only and is hard-excluded from every fan-out / route /
+health / init / clean-all path by name substring match. Explicit
+`pool on pi5-akida <cmd>` / `pool clean pi5-akida` still work.
+
+macOS pool hosts are never auto-dispatch candidates for the OS-agnostic
+round-robin (workstation protection). Explicit `pool on <mac> <cmd>` still
+works for any command.
+
+Single file, stdlib only. Remote payloads (init features · disk-cleanup ·
+usage probe) are embedded bash, dispatched over ssh — they configure the
+remote Linux/macOS hosts, which need nothing installed.
+"""
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+# ── state ──────────────────────────────────────────────────────────────────
+
+# Wall-clock ceiling for a single foreground dispatch (fork-storm guard, TIME
+# axis). ssh keepalive already tears a DEAD connection down in ~30s; but a
+# remote command that hangs while the connection stays healthy is invisible to
+# keepalive — one held a local ssh ~3h. `_stream_live` bounds that case by wall
+# clock. In-source literal, not an env opt-out; generous enough for any legit
+# interactive command — truly long jobs belong on `pool bg` (detached) or cloud
+# nohup, neither of which holds a foreground ssh.
+DISPATCH_TIMEOUT_S = 3600  # 1h
+
+SSH_OPTS = [
+    "ssh",
+    "-o", "BatchMode=yes",
+    "-o", "ConnectTimeout=3",
+    "-o", "StrictHostKeyChecking=accept-new",
+]
+
+
+def _state_path():
+    """$POOL_STATE override, else ~/.pool/pool.json."""
+    return os.environ.get("POOL_STATE") or os.path.join(
+        os.path.expanduser("~"), ".pool", "pool.json"
+    )
+
+
+def _state_dir():
+    return os.path.dirname(_state_path()) or "."
+
+
+def _load():
+    path = _state_path()
+    if not os.path.exists(path):
+        return {"hosts": []}
+    try:
+        raw = open(path, encoding="utf-8").read()
+    except OSError:
+        return {"hosts": []}
+    # Empty / torn read (e.g. caught mid-truncate by a legacy non-atomic
+    # writer): recover from the last good backup rather than returning an
+    # empty roster that a subsequent _save would then make permanent.
+    if not raw.strip():
+        bak = path + ".bak"
+        if os.path.exists(bak):
+            try:
+                braw = open(bak, encoding="utf-8").read()
+                if braw.strip():
+                    return json.loads(braw)
+            except (OSError, ValueError):
+                pass
+        return {"hosts": []}
+    try:
+        root = json.loads(raw)
+    except ValueError:
+        print(f"pool: {path} is not valid JSON — refusing to touch it", file=sys.stderr)
+        sys.exit(1)
+    root.setdefault("hosts", [])
+    return root
+
+
+def _disk_host_count():
+    """Host count of the roster currently ON DISK, independent of any in-memory
+    root. Used by _save's empty-clobber guard. Corrupt / unreadable → 0."""
+    path = _state_path()
+    if not os.path.exists(path):
+        return 0
+    try:
+        raw = open(path, encoding="utf-8").read()
+        if not raw.strip():
+            return 0
+        return len(json.loads(raw).get("hosts", []))
+    except (OSError, ValueError):
+        return 0
+
+
+def _save(root, allow_empty=False):
+    """Persist the roster. Concurrent sessions / agents share this single
+    ~/.pool/pool.json, so the write is hardened three ways against a race wipe:
+      1. empty-clobber guard — refuse to overwrite a live roster with an empty
+         one unless the caller explicitly intends it (cmd_rm passes allow_empty)
+      2. backup rotation     — snapshot the current good roster to pool.json.bak
+      3. atomic write        — write a unique temp in the same dir, then
+         os.replace (rename(2), atomic on one fs) so a concurrent reader never
+         sees a truncated file — which was the original wipe vector.
+    """
+    path = _state_path()
+    directory = _state_dir()
+    os.makedirs(directory, exist_ok=True)
+
+    if not root.get("hosts") and not allow_empty:
+        if _disk_host_count() > 0:
+            print(
+                "pool: refusing to overwrite a live roster with an empty one "
+                f"(kept on disk; backup at {path}.bak)"
+            )
+            return
+
+    if os.path.exists(path):
+        try:
+            with open(path, "rb") as src, open(path + ".bak", "wb") as dst:
+                dst.write(src.read())
+        except OSError:
+            pass
+
+    fd, tmp = tempfile.mkstemp(prefix="pool.json.", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(root, fh, indent=2, ensure_ascii=False)
+            fh.write("\n")
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def _find(hosts, name):
+    for i, h in enumerate(hosts):
+        if h.get("name", "") == name:
+            return i
+    return -1
+
+
+# ── string / formatting helpers ────────────────────────────────────────────
+
+
+def _pad(s, n):
+    return s + " " * max(0, n - len(s))
+
+
+def _is_akida(h):
+    """pi5-akida is anima-only: NEVER an auto-dispatch / fan-out candidate.
+    Match on name OR ssh substring so a renamed clone is still caught.
+    Explicit `pool on pi5-akida <cmd>` bypasses this guard."""
+    return "akida" in h.get("name", "") or "akida" in h.get("ssh", "")
+
+
+def _last_line(s):
+    for line in reversed(s.split("\n")):
+        if line.strip():
+            return line.strip()
+    return ""
+
+
+# ── exec helpers ───────────────────────────────────────────────────────────
+
+
+def _ssh_argv(target, remote=None):
+    """ssh argv for `target`. `remote` (a single command string) is passed as one
+    argument after `--`, so the REMOTE shell — not the local one — expands
+    $(...) · ; · globs."""
+    argv = list(SSH_OPTS) + [target]
+    if remote is not None:
+        argv += ["--", remote]
+    return argv
+
+
+def _probe_os(target):
+    """-> "macos" | "linux" | "unknown"."""
+    try:
+        r = subprocess.run(
+            _ssh_argv(target, "uname -s"),
+            capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return "unknown"
+    if r.returncode != 0:
+        return "unknown"
+    return {"Darwin": "macos", "Linux": "linux"}.get(r.stdout.strip(), "unknown")
+
+
+def _stream_live(argv, stdin_data=None):
+    """Run argv with stdout/stderr inherited (true live streaming). Returns the
+    exit code; 124 if the dispatch ceiling is hit."""
+    # The child writes to our fd directly, so anything we buffered (route's
+    # ranking, init's feature label) must land first or it prints out of order.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    try:
+        proc = subprocess.Popen(
+            argv, stdin=subprocess.PIPE if stdin_data is not None else None
+        )
+    except OSError as exc:
+        print(f"pool: cannot exec ssh: {exc}", file=sys.stderr)
+        return 127
+    try:
+        if stdin_data is not None:
+            proc.stdin.write(stdin_data.encode())
+            proc.stdin.close()
+        return proc.wait(timeout=DISPATCH_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        print(
+            f"pool: dispatch exceeded {DISPATCH_TIMEOUT_S}s ceiling — killed "
+            "(exit 124). long jobs → `pool bg` / cloud nohup."
+        )
+        return 124
+    except KeyboardInterrupt:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        return 130
+    except BrokenPipeError:
+        return proc.wait()
+
+
+def _parallel(cmds, timeout_s, max_workers, stdin_data=None, merge_stderr=False):
+    """Run argv lists concurrently (up to max_workers; <=0 = all). Collects each
+    command's stdout into outs[i] and its exit into exits[i]. timeout_s > 0
+    bounds the WHOLE batch by wall clock; stragglers are killed with exit 124.
+    Returns (exits, outs)."""
+    n = len(cmds)
+    if n == 0:
+        return [], []
+    workers = max_workers if max_workers and max_workers > 0 else n
+    workers = max(1, min(workers, n))
+    deadline = time.monotonic() + timeout_s if timeout_s and timeout_s > 0 else None
+    payload = stdin_data.encode() if stdin_data is not None else None
+    err = subprocess.STDOUT if merge_stderr else subprocess.DEVNULL
+
+    def run(cmd):
+        remaining = None
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return 124, ""
+        try:
+            r = subprocess.run(
+                cmd, input=payload, stdout=subprocess.PIPE, stderr=err,
+                timeout=remaining,
+            )
+            return r.returncode, (r.stdout or b"").decode("utf-8", "replace")
+        except subprocess.TimeoutExpired as exc:
+            out = exc.stdout or b""
+            if isinstance(out, str):
+                out = out.encode()
+            return 124, out.decode("utf-8", "replace")
+        except OSError as exc:
+            return 127, str(exc)
+
+    exits = [-1] * n
+    outs = [""] * n
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for i, (rc, out) in enumerate(pool.map(run, cmds)):
+            exits[i], outs[i] = rc, out
+    return exits, outs
+
+
+# ── embedded bash payloads (raw — sent over ssh to remote hosts) ────────────
+
+USAGE_PROBE = r"""export LC_ALL=C
+OS=$(uname -s)
+LOAD=$(uptime | sed -E 's/.*load averages?: //' | awk '{print $1}' | tr -d ',')
+case "$OS" in
+    Darwin)
+        RT=$(( $(sysctl -n hw.memsize) / 1073741824 ))
+        PAGES=$(vm_stat | awk '/Pages (active|wired down|occupied by compressor)/ {gsub(/\./,"",$NF); s+=$NF} END {print s+0}')
+        RU=$(( PAGES * 4096 / 1073741824 ))
+        DSK=$(df -h / | tail -1 | awk '{print $3"/"$2}')
+        GPU="-"
+        ;;
+    Linux)
+        RT=$(free -g | awk 'NR==2 {print $2}')
+        RU=$(free -g | awk 'NR==2 {print $3}')
+        DSK=$(df -h / | tail -1 | awk '{print $3"/"$2}')
+        if command -v nvidia-smi >/dev/null 2>&1; then
+            GPU=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1 | awk '{print $1"%"}')
+        else
+            GPU="-"
+        fi
+        ;;
+    *)
+        RT=0; RU=0; DSK="-"; GPU="-"
+        ;;
+esac
+echo "$LOAD|$RU/${RT}G|$GPU|$DSK"
+"""
+
+TAILSCALE_SH = r"""set -e
+HOSTN="$(hostname)"
+if command -v tailscale >/dev/null 2>&1; then
+    echo "[$HOSTN] tailscale already installed"
+    tailscale --version | head -1
+    exit 0
+fi
+OS=$(uname -s)
+if [ "$OS" = "Darwin" ]; then
+    if command -v brew >/dev/null 2>&1; then
+        brew install tailscale
+        brew services start tailscale || true
+    else
+        echo "[$HOSTN] ERROR: Homebrew required for tailscale install on macOS" >&2
+        exit 1
+    fi
+elif [ "$OS" = "Linux" ]; then
+    curl -fsSL https://tailscale.com/install.sh | __SUDO__ sh
+else
+    echo "[$HOSTN] ERROR: unsupported OS: $OS" >&2
+    exit 1
+fi
+echo "[$HOSTN] tailscale installed — run \`__SUDO__ tailscale up\` to authenticate"
+"""
+
+# Shared disk-cleanup logic — the body of both the `pool clean` verb (run now,
+# over ssh) and the `/etc/cron.daily/disk-cleanup` hook that `pool init`
+# installs. Self-detects privilege (uid 0 → no sudo; else `sudo -n`). Safe tier
+# runs every time; deep tier (model caches · docker) is gated on --deep or the
+# host being past POOL_CLEAN_THRESH (default 85%). Uniform mtime retention.
+CLEANUP_SH = r"""set -u
+HOSTN=$(hostname)
+DRY=${POOL_CLEAN_DRYRUN:-0}
+THRESH=${POOL_CLEAN_THRESH:-85}
+RETAIN=${POOL_CLEAN_RETAIN:-3}
+if [ "$(uname -s)" != Linux ]; then
+    echo "[$HOSTN] disk-cleanup skipped — Linux only (macOS self-manages caches/logs)"
+    exit 0
+fi
+if [ "$(id -u)" = 0 ]; then SUDO=; else SUDO="sudo -n"; fi
+
+dpct()   { df -Pk / | awk 'NR==2 {gsub(/%/,"",$5); print $5+0}'; }
+davail() { df -Pk / | awk 'NR==2 {print $4+0}'; }
+human()  { awk -v k="${1:-0}" 'BEGIN{u="KMGT";i=1;while(k>=1024&&i<4){k/=1024;i++}printf "%.1f%s",k,substr(u,i,1)}'; }
+
+B_PCT=$(dpct); B_AV=$(davail)
+DEEP=${POOL_CLEAN_DEEP:-0}; GATE=
+if [ "$DEEP" != 1 ] && [ "$B_PCT" -ge "$THRESH" ]; then
+    DEEP=1; GATE=" · deep tier engaged (${B_PCT}% >= ${THRESH}%)"
+fi
+MODE=safe; [ "$DEEP" = 1 ] && MODE=safe+deep
+[ "$DRY" = 1 ] && MODE="$MODE [dry-run]"
+echo "[$HOSTN] disk-cleanup — $MODE · ${B_PCT}% used · retain ${RETAIN}d$GATE"
+
+vac() {
+    [ -e "$1" ] || return 0
+    if [ "$DRY" = 1 ]; then
+        n=$($SUDO find "$1" -type f -mtime +"$RETAIN" 2>/dev/null | wc -l | tr -d ' ')
+        [ "${n:-0}" -gt 0 ] && echo "  dry · $1 — ${n} file(s) >${RETAIN}d"
+        return 0
+    fi
+    $SUDO find "$1" -type f -mtime +"$RETAIN" -delete 2>/dev/null || true
+    $SUDO find "$1" -depth -type d -empty -delete 2>/dev/null || true
+}
+
+if [ "$DRY" = 1 ]; then
+    echo "  dry · journalctl vacuum (2G/${RETAIN}d) · apt autoremove+clean · snap disabled-revs"
+else
+    $SUDO journalctl --vacuum-size=2G           >/dev/null 2>&1 || true
+    $SUDO journalctl --vacuum-time="${RETAIN}d" >/dev/null 2>&1 || true
+    export DEBIAN_FRONTEND=noninteractive
+    $SUDO apt-get -y autoremove --purge         >/dev/null 2>&1 || true
+    $SUDO apt-get clean                         >/dev/null 2>&1 || true
+    if command -v snap >/dev/null 2>&1; then
+        snap list --all 2>/dev/null | awk '/disabled/ {print $1, $3}' | while read -r s r; do
+            [ -n "$s" ] && $SUDO snap remove "$s" --revision="$r" >/dev/null 2>&1 || true
+        done
+    fi
+fi
+for p in /var/log /var/crash /tmp /var/tmp; do vac "$p"; done
+for d in /home/* /root; do
+    for c in uv pip puppeteer mathlib thumbnails; do vac "$d/.cache/$c"; done
+done
+
+if [ "$DEEP" = 1 ]; then
+    for d in /home/* /root; do
+        for c in huggingface torch torch_extensions npm yarn go-build; do vac "$d/.cache/$c"; done
+    done
+    if command -v docker >/dev/null 2>&1; then
+        if [ "$DRY" = 1 ]; then
+            echo "  dry · docker system prune (until=$((RETAIN*24))h)"
+        else
+            $SUDO docker system prune -af --filter "until=$((RETAIN*24))h" >/dev/null 2>&1 || true
+        fi
+    fi
+fi
+
+A_PCT=$(dpct); A_AV=$(davail)
+FREED=$((A_AV - B_AV)); [ "$FREED" -lt 0 ] && FREED=0
+if [ "$DRY" = 1 ]; then
+    echo "[$HOSTN] dry-run complete — nothing deleted"
+else
+    echo "[$HOSTN] done — ${B_PCT}% -> ${A_PCT}% used · freed $(human "$FREED") · $(human "$A_AV") free"
+fi
+"""
+
+# `/etc/cron.daily/disk-cleanup` body — the shared logic above, logged. cron
+# runs it as root (no sudo) in gated mode (deep tier waits for the threshold).
+CRON_FILE = (
+    "#!/bin/sh\n"
+    "# pool disk-cleanup — installed by `pool init`. Safe tier daily; deep tier\n"
+    "# (model caches · docker) engages only when the disk is past the threshold.\n"
+    "exec >>/var/log/pool-cleanup.log 2>&1\n"
+    'echo "=== $(date -Is 2>/dev/null || date) ==="\n'
+    + CLEANUP_SH
+)
+
+# `pool init` feature wrapper — installs the cron file as the cron.daily hook.
+DISK_CLEANUP_SH = (
+    "set -e\n"
+    'HOSTN="$(hostname)"\n'
+    'if [ "$(uname -s)" != "Linux" ]; then\n'
+    '    echo "[$HOSTN] disk-cleanup skipped — Linux only"\n'
+    "    exit 0\n"
+    "fi\n"
+    "__SUDO__ tee /etc/cron.daily/disk-cleanup >/dev/null <<'POOL_CRON_EOF'\n"
+    + CRON_FILE
+    + "POOL_CRON_EOF\n"
+    "__SUDO__ chmod 755 /etc/cron.daily/disk-cleanup\n"
+    'echo "[$HOSTN] /etc/cron.daily/disk-cleanup installed (safe tier daily · '
+    'deep tier at >=85% · log /var/log/pool-cleanup.log)"\n'
+)
+
+NO_SLEEP_SH = r"""set -e
+HOSTN="$(hostname)"
+OS=$(uname -s)
+if [ "$OS" != "Darwin" ]; then
+    echo "[$HOSTN] no-sleep skipped — macOS only"
+    exit 0
+fi
+__SUDO__ pmset -a displaysleep 0 sleep 0 disksleep 0
+defaults -currentHost write com.apple.screensaver idleTime 0
+defaults write com.apple.screensaver idleTime 0
+echo "[$HOSTN] no-sleep: pmset displaysleep=0 sleep=0 disksleep=0; screensaver idleTime=0"
+"""
+
+PERSISTENT_JOURNAL_SH = r"""set -e
+HOSTN="$(hostname)"
+if [ "$(uname -s)" != "Linux" ]; then
+    echo "[$HOSTN] persistent-journal skipped — Linux only"
+    exit 0
+fi
+if [ -d /var/log/journal ]; then
+    echo "[$HOSTN] persistent-journal already enabled (/var/log/journal exists)"
+    exit 0
+fi
+__SUDO__ mkdir -p /var/log/journal
+__SUDO__ systemd-tmpfiles --create --prefix /var/log/journal
+__SUDO__ systemctl restart systemd-journald
+echo "[$HOSTN] persistent-journal: /var/log/journal created (journalctl -b -1 survives reboots)"
+"""
+
+PANIC_RECOVERY_SH = r"""set -e
+HOSTN="$(hostname)"
+if [ "$(uname -s)" != "Linux" ]; then
+    echo "[$HOSTN] panic-recovery skipped — Linux only"
+    exit 0
+fi
+__SUDO__ tee /etc/sysctl.d/60-pool-recovery.conf >/dev/null <<'SYSCTL_EOF'
+kernel.panic = 10
+kernel.panic_on_oom = 0
+SYSCTL_EOF
+__SUDO__ sysctl -q --system
+echo "[$HOSTN] panic-recovery: kernel.panic=10, kernel.panic_on_oom=0"
+"""
+
+EARLYOOM_SH = r"""set -e
+HOSTN="$(hostname)"
+if [ "$(uname -s)" != "Linux" ]; then
+    echo "[$HOSTN] earlyoom skipped — Linux only"
+    exit 0
+fi
+if systemctl is-active --quiet earlyoom 2>/dev/null; then
+    echo "[$HOSTN] earlyoom already active"
+    exit 0
+fi
+export DEBIAN_FRONTEND=noninteractive
+__SUDO__ apt-get update -qq
+__SUDO__ apt-get install -y earlyoom
+__SUDO__ systemctl enable --now earlyoom
+echo "[$HOSTN] earlyoom enabled (preempts kernel OOM-killer at <10% free RAM+swap)"
+"""
+
+SWAPFILE_SH = r"""set -e
+HOSTN="$(hostname)"
+if [ "$(uname -s)" != "Linux" ]; then
+    echo "[$HOSTN] swapfile skipped — Linux only"
+    exit 0
+fi
+have_kb=$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo)
+have_g=$((have_kb / 1024 / 1024))
+if [ "$have_g" -ge 30 ]; then
+    echo "[$HOSTN] swapfile skipped — existing swap ${have_g}G already >= 30G"
+    exit 0
+fi
+SWAP=/swapfile-pool
+if [ ! -f "$SWAP" ]; then
+    __SUDO__ fallocate -l 32G "$SWAP" 2>/dev/null \
+        || __SUDO__ dd if=/dev/zero of="$SWAP" bs=1M count=32768 status=none
+    __SUDO__ chmod 600 "$SWAP"
+    __SUDO__ mkswap "$SWAP" >/dev/null
+fi
+if ! swapon --show=NAME --noheadings 2>/dev/null | grep -qx "$SWAP"; then
+    __SUDO__ swapon "$SWAP"
+fi
+if ! grep -qE "^${SWAP}[[:space:]]" /etc/fstab; then
+    echo "${SWAP} none swap sw 0 0" | __SUDO__ tee -a /etc/fstab >/dev/null
+fi
+__SUDO__ tee /etc/sysctl.d/61-pool-swap.conf >/dev/null <<'SWAP_EOF'
+vm.swappiness = 10
+SWAP_EOF
+__SUDO__ sysctl -q --system
+echo "[$HOSTN] swapfile: ${SWAP} (32G) active; vm.swappiness=10"
+"""
+
+WATCHDOG_SH = r"""set -e
+HOSTN="$(hostname)"
+if [ "$(uname -s)" != "Linux" ]; then
+    echo "[$HOSTN] watchdog skipped — Linux only"
+    exit 0
+fi
+echo 'softdog' | __SUDO__ tee /etc/modules-load.d/softdog.conf >/dev/null
+__SUDO__ modprobe softdog 2>/dev/null || true
+__SUDO__ mkdir -p /etc/systemd/system.conf.d
+__SUDO__ tee /etc/systemd/system.conf.d/50-pool-watchdog.conf >/dev/null <<'WD_EOF'
+[Manager]
+RuntimeWatchdogSec=30s
+ShutdownWatchdogSec=4min
+WD_EOF
+__SUDO__ systemctl daemon-reexec
+echo "[$HOSTN] watchdog: softdog + systemd RuntimeWatchdogSec=30s (auto-reset on kernel hang)"
+"""
+
+INIT_FEATURES = [
+    ("tailscale", TAILSCALE_SH),
+    ("disk-cleanup", DISK_CLEANUP_SH),
+    ("no-sleep", NO_SLEEP_SH),
+    ("persistent-journal", PERSISTENT_JOURNAL_SH),
+    ("panic-recovery", PANIC_RECOVERY_SH),
+    ("earlyoom", EARLYOOM_SH),
+    ("swapfile", SWAPFILE_SH),
+    ("watchdog", WATCHDOG_SH),
+]
+
+
+# ── verbs ──────────────────────────────────────────────────────────────────
+
+
+def cmd_add(name, ssh_t, sudo):
+    root = _load()
+    hosts = root["hosts"]
+    if _find(hosts, name) >= 0:
+        print(f"already in roster: {name}")
+        return 1
+    host = {"name": name, "ssh": ssh_t}
+    if sudo:
+        host["sudo"] = True
+    host["os"] = _probe_os(ssh_t)
+    hosts.append(host)
+    _save(root)
+    line = f"+ {name} ({ssh_t})  {host['os']}"
+    if sudo:
+        line += "  sudo"
+    print(line)
+    return 0
+
+
+def cmd_rm(name):
+    root = _load()
+    hosts = root["hosts"]
+    idx = _find(hosts, name)
+    if idx < 0:
+        print(f"not in roster: {name}")
+        return 1
+    del hosts[idx]
+    # rm is the one verb that may legitimately empty the roster (removing the
+    # last host) — allow_empty=True exempts it from the empty-clobber guard.
+    _save(root, allow_empty=True)
+    print(f"- {name}")
+    return 0
+
+
+def cmd_refresh():
+    root = _load()
+    for host in root["hosts"]:
+        old = host.get("os", "—")
+        new = _probe_os(host.get("ssh", ""))
+        host["os"] = new
+        print(f"{host.get('name', '?')}: {old} → {new}")
+    _save(root)
+    return 0
+
+
+def _probe_usage(hosts):
+    """Parallel usage probe over `hosts` -> {name: (load, ram, gpu, disk)}."""
+    cmds = [_ssh_argv(h.get("ssh", ""), "bash -s") for h in hosts]
+    _, outs = _parallel(cmds, 8, 8, stdin_data=USAGE_PROBE)
+    usage = {}
+    for host, out in zip(hosts, outs):
+        parts = _last_line(out).split("|")
+        usage[host.get("name", "?")] = tuple(parts) if len(parts) == 4 else ("-",) * 4
+    return usage
+
+
+def cmd_list(as_json, live):
+    root = _load()
+    hosts = root["hosts"]
+    usage = _probe_usage(hosts) if live and hosts else {}
+
+    if as_json:
+        if live:
+            for host in hosts:
+                load, ram, gpu, disk = usage.get(host.get("name", "?"), ("-",) * 4)
+                host["usage"] = {"load": load, "ram": ram, "gpu": gpu, "disk": disk}
+        print(json.dumps(root, indent=2, ensure_ascii=False))
+        return 0
+
+    if not hosts:
+        print("empty roster — `pool add <name> <user@host>` to start")
+        return 0
+
+    nw = max([1] + [len(h.get("name", "?")) for h in hosts])
+    sw = max([1] + [len(h.get("ssh", "?")) for h in hosts])
+    ow = max([1] + [len(h.get("os", "-")) for h in hosts])
+
+    if live:
+        cols = list(zip(*usage.values())) if usage else [(), (), (), ()]
+        lw = max([4] + [len(x) for x in cols[0]])
+        rw = max([3] + [len(x) for x in cols[1]])
+        gw = max([3] + [len(x) for x in cols[2]])
+        dw = max([4] + [len(x) for x in cols[3]])
+        print(
+            f"{_pad('', nw)}  {_pad('', sw)}  {_pad('', ow)}  "
+            f"{_pad('load', lw)}  {_pad('ram', rw)}  {_pad('gpu', gw)}  "
+            f"{_pad('disk', dw)}  {_pad('sudo', 4)}  desc"
+        )
+
+    for host in hosts:
+        name = host.get("name", "?")
+        row = (
+            f"{_pad(name, nw)}  {_pad(host.get('ssh', '?'), sw)}  "
+            f"{_pad(host.get('os', '-'), ow)}  "
+        )
+        if live:
+            load, ram, gpu, disk = usage.get(name, ("-",) * 4)
+            row += (
+                f"{_pad(load, lw)}  {_pad(ram, rw)}  {_pad(gpu, gw)}  "
+                f"{_pad(disk, dw)}  "
+            )
+        row += f"{_pad('sudo' if host.get('sudo') else '', 4)}  {host.get('description', '')}"
+        print(row.rstrip())
+    return 0
+
+
+def cmd_on(name, remote):
+    root = _load()
+    idx = _find(root["hosts"], name)
+    if idx < 0:
+        print(f"not in roster: {name}")
+        return 1
+    return _stream_live(_ssh_argv(root["hosts"][idx].get("ssh", ""), remote))
+
+
+def cmd_bg(name, remote):
+    """Fire-and-forget remote dispatch. Uses `ssh -f -n` so the local ssh client
+    backgrounds itself immediately (after auth) and closes stdin; combined with
+    the canonical `nohup ... > file 2>&1 &` pattern on the remote, this
+    guarantees the local wrapper exits in <1s rather than becoming a 99% CPU
+    zombie holding a half-open output pipe. Use for any `nohup ... &` style
+    remote launch; use plain `pool on` when you want to stream output."""
+    root = _load()
+    idx = _find(root["hosts"], name)
+    if idx < 0:
+        print(f"not in roster: {name}")
+        return 1
+    target = root["hosts"][idx].get("ssh", "")
+    argv = list(SSH_OPTS) + ["-f", "-n", target, "--", remote]
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        print("pool: bg dispatch did not detach within 60s")
+        return 124
+    if r.stdout:
+        print(r.stdout, end="")
+    if r.stderr:
+        print(r.stderr, end="")
+    return r.returncode
+
+
+def cmd_on_all(remote, jobs, timeout_s):
+    """Parallel dispatch to every host (skips pi5-akida). Each output line is
+    prefixed `[hostname]`. Aggregate exit = max returncode."""
+    hosts = [h for h in _load()["hosts"] if not _is_akida(h)]
+    if not hosts:
+        print("no fan-out candidates (roster only has pi5-akida — anima-only)")
+        return 1
+    names = [h.get("name", "?") for h in hosts]
+    cmds = [_ssh_argv(h.get("ssh", ""), remote) for h in hosts]
+    exits, outs = _parallel(cmds, timeout_s, jobs, merge_stderr=True)
+    nw = max(len(n) for n in names)
+    rc_overall = 0
+    for name, out, rc in zip(names, outs, exits):
+        for line in out.split("\n"):
+            if line:
+                print(f"[{_pad(name, nw)}] {line}")
+        if rc > rc_overall:
+            rc_overall = rc
+    return rc_overall
+
+
+def cmd_route(remote):
+    """Pick the routing-eligible host with the lowest 1-min load and dispatch
+    <cmd> there. Routing-eligible = every host except pi5-akida (anima-only).
+    Prints the scored ranking, then streams the chosen host's output."""
+    hosts = [h for h in _load()["hosts"] if not _is_akida(h)]
+    if not hosts:
+        print("no routing-eligible hosts (roster only has pi5-akida — anima-only)")
+        return 1
+    usage = _probe_usage(hosts)
+    loads = []
+    for host in hosts:
+        raw = usage.get(host.get("name", "?"), ("-",) * 4)[0]
+        try:
+            loads.append(float(raw))
+        except ValueError:
+            loads.append(999999.0)
+    best = min(range(len(hosts)), key=lambda i: loads[i])
+    nw = max(len(h.get("name", "?")) for h in hosts)
+    for i, host in enumerate(hosts):
+        mark = "→ " if i == best else "  "
+        print(f"{mark}{_pad(host.get('name', '?'), nw)}  load {loads[i]}")
+    print(f"route → {hosts[best].get('name', '?')}: {remote}")
+    return _stream_live(_ssh_argv(hosts[best].get("ssh", ""), remote))
+
+
+def cmd_status():
+    hosts = _load()["hosts"]
+    if not hosts:
+        print("empty roster")
+        return 0
+    width = max(len(h.get("name", "?")) for h in hosts)
+    cmds = [_ssh_argv(h.get("ssh", ""), "true") for h in hosts]
+    exits, _ = _parallel(cmds, 8, 8)
+    for host, rc in zip(hosts, exits):
+        tag = "ok " if rc == 0 else "x  "
+        print(f"{_pad(host.get('name', '?'), width)}  [{tag}]  {host.get('ssh', '?')}")
+    return 0
+
+
+def cmd_health():
+    """Per-host hexa-lang fleet probe. ssh into every non-akida host in parallel
+    and run a 2-line smoke: `hexa --version` (binary exists + dispatcher works)
+    and `hexa loop --status` from ~/core/hexa-lang (loop verb dispatch +
+    cycle.hexa accessible). One row per host; exit 1 if any host fails — so
+    `pool health || alert` can drive a cron / launchd watcher.
+
+    Motivation: fleet installs drift silently — `pool status` only shows ssh
+    reachability, not hexa state."""
+    hosts = _load()["hosts"]
+    if not hosts:
+        print("empty roster")
+        return 0
+    width = max([4] + [len(h.get("name", "?")) for h in hosts])
+    # 2-stage stdout probe — first line = `hexa --version`, then `---`
+    # delimiter, then `hexa loop --status` first line. `cd ... 2>/dev/null`
+    # means hosts missing ~/core/hexa-lang fall through to a blank loop-state
+    # which parses as 🟡 (loop-only-fail), distinct from 🔴 (no hexa at all).
+    probe = (
+        "(hexa --version 2>&1 | head -1; echo '---'; "
+        "cd ~/core/hexa-lang 2>/dev/null && hexa loop --status 2>&1 | head -1)"
+    )
+    live = [h for h in hosts if not _is_akida(h)]
+    exits, outs = _parallel(
+        [_ssh_argv(h.get("ssh", ""), probe) for h in live], 15, 8
+    )
+    results = {h.get("name", "?"): (rc, out) for h, rc, out in zip(live, exits, outs)}
+
+    vw = lw = 22
+    print(f"{_pad('host', width)}  {_pad('hexa version', vw)}  {_pad('loop verb', lw)}  verdict")
+    bad = 0
+    for host in hosts:
+        name = host.get("name", "?")
+        if _is_akida(host):
+            print(f"{_pad(name, width)}  {_pad('(anima-only)', vw)}  {_pad('-', lw)}  ⚪ skipped")
+            continue
+        _rc, out = results.get(name, (1, ""))
+        parts = out.split("---")
+        version = parts[0].strip() if parts else ""
+        loop_state = parts[1].strip() if len(parts) >= 2 else ""
+        # Verdict reads the probe OUTPUT, not the subshell's exit code: a
+        # failing `hexa loop --status` (or a missing ~/core/hexa-lang) makes the
+        # whole `cd ... && ...` chain exit non-zero even though `hexa --version`
+        # answered — which would collapse 🟡 into 🔴 and make the three-state
+        # verdict unreachable.
+        verdict = "🔴 broken"
+        if version.startswith("hexa "):
+            verdict = "🟢 healthy" if loop_state.startswith("[loop]") else "🟡 loop-fail"
+        if not verdict.startswith("🟢"):
+            bad += 1
+        version = version or "(unreachable)"
+        loop_state = loop_state or "-"
+        if len(version) > vw:
+            version = version[: vw - 3] + "..."
+        if len(loop_state) > lw:
+            loop_state = loop_state[: lw - 3] + "..."
+        print(f"{_pad(name, width)}  {_pad(version, vw)}  {_pad(loop_state, lw)}  {verdict}")
+    return 1 if bad else 0
+
+
+def cmd_init():
+    hosts = _load()["hosts"]
+    rc_overall = 0
+    any_host = False
+    for host in hosts:
+        name = host.get("name", "?")
+        if _is_akida(host):
+            print(f"=== skip {name} (anima-only) ===")
+            continue
+        any_host = True
+        target = host.get("ssh", "")
+        sudo_token = "sudo" if host.get("sudo") else ""
+        print(f"=== pool init {name} ({target}) ===")
+        for label, script in INIT_FEATURES:
+            print(f"  · {label}")
+            rc = _stream_live(
+                _ssh_argv(target, "bash -s"),
+                stdin_data=script.replace("__SUDO__", sudo_token),
+            )
+            if rc != 0:
+                print(f"    ! {label} failed (exit {rc})")
+                rc_overall = rc
+    if not any_host:
+        print("no hosts to init (roster only has pi5-akida — anima-only)")
+        return 1
+    return rc_overall
+
+
+def cmd_clean(targets, dry, deep):
+    hosts = _load()["hosts"]
+    chosen = []
+    if targets == ["all"]:
+        for host in hosts:
+            if _is_akida(host):
+                print(f"· skipped {host.get('name', '?')} (anima-only)")
+            else:
+                chosen.append(host)
+    else:
+        for name in targets:
+            idx = _find(hosts, name)
+            if idx < 0:
+                print(f"not in roster: {name}")
+                return 1
+            chosen.append(hosts[idx])
+
+    if not chosen:
+        print("no host to clean")
+        return 1
+    envp = ""
+    if dry:
+        envp += "export POOL_CLEAN_DRYRUN=1\n"
+    if deep:
+        envp += "export POOL_CLEAN_DEEP=1\n"
+    script = envp + CLEANUP_SH
+    rc_overall = 0
+    for host in chosen:
+        rc = _stream_live(_ssh_argv(host.get("ssh", ""), "bash -s"), stdin_data=script)
+        if rc != 0:
+            print(f"  ! clean failed on {host.get('name', '?')} (exit {rc})")
+            rc_overall = rc
+    return rc_overall
+
+
+def cmd_desc(name, text):
+    root = _load()
+    idx = _find(root["hosts"], name)
+    if idx < 0:
+        print(f"not in roster: {name}")
+        return 1
+    if text:
+        root["hosts"][idx]["description"] = text
+        print(f"{name}: {text}")
+    else:
+        root["hosts"][idx].pop("description", None)
+        print(f"{name}: description cleared")
+    _save(root)
+    return 0
+
+
+HELP = """pool — host roster + remote exec
+
+  pool add <name> <user@host> [--sudo]   register a host (probes OS via uname -s)
+  pool rm  <name>                         remove from roster
+  pool list [--json] [--fast]             roster + live cpu/ram/gpu/disk (--fast skips probe)
+  pool on  <name> <cmd...>                ssh + exec on host
+  pool on  all <cmd...> [--jobs N] [--timeout S]   parallel fan-out (every host except pi5-akida)
+  pool route <cmd...>                     dispatch to the lowest-load host (skips pi5-akida)
+  pool bg <name> <cmd...>                 fire-and-forget dispatch (ssh -f -n; for `nohup ... &` patterns)
+  pool status                             live reachability probe (each host)
+  pool health                             hexa-lang fleet probe (hexa --version + loop verb); exit 1 on any failure
+  pool refresh                            re-probe os for every host
+  pool init                               bootstrap every host with all features (skips pi5-akida)
+                                          (tailscale · disk-cleanup · no-sleep · persistent-journal · panic-recovery · earlyoom · swapfile · watchdog)
+  pool clean <name>|all [--dry-run] [--deep]   run disk-cleanup now (safe tier; --deep adds model caches + docker; --dry-run measures only)
+  pool desc <name> [text...]              set a host description (shown in pool list)
+
+pi5-akida is anima-only and is hard-excluded from every fan-out / route /
+health / init / clean-all path. Explicit `pool on pi5-akida <cmd>` still works.
+
+state: ~/.pool/pool.json"""
+
+
+def main(argv):
+    if len(argv) < 2 or argv[1] in ("help", "--help", "-h"):
+        print(HELP)
+        return 0
+    verb = argv[1]
+    rest = argv[2:]
+
+    if verb == "list":
+        return cmd_list("--json" in rest, "--fast" not in rest)
+    if verb == "status":
+        return cmd_status()
+    if verb == "health":
+        return cmd_health()
+    if verb == "refresh":
+        return cmd_refresh()
+    if verb == "init":
+        return cmd_init()
+
+    if verb == "route":
+        if not rest:
+            print("usage: pool route <cmd...>")
+            return 1
+        return cmd_route(" ".join(rest))
+
+    if verb == "bg":
+        if len(rest) < 2:
+            print("usage: pool bg <name> <cmd...>")
+            return 1
+        return cmd_bg(rest[0], " ".join(rest[1:]))
+
+    if verb == "on":
+        if not rest:
+            print("usage: pool on <name> <cmd...>  OR  pool on all <cmd...>")
+            return 1
+        if rest[0] == "all":
+            jobs, timeout_s, words = 0, 30, []
+            i = 1
+            while i < len(rest):
+                if rest[i] == "--jobs" and i + 1 < len(rest):
+                    jobs = int(rest[i + 1])
+                    i += 1
+                elif rest[i] == "--timeout" and i + 1 < len(rest):
+                    timeout_s = int(rest[i + 1])
+                    i += 1
+                else:
+                    words.append(rest[i])
+                i += 1
+            if not words:
+                print("usage: pool on all <cmd...>")
+                return 1
+            return cmd_on_all(" ".join(words), jobs, timeout_s)
+        if len(rest) < 2:
+            print("usage: pool on <name> <cmd...>")
+            return 1
+        return cmd_on(rest[0], " ".join(rest[1:]))
+
+    if verb == "add":
+        sudo = "--sudo" in rest
+        pos = [a for a in rest if a != "--sudo"]
+        if len(pos) < 2:
+            print("usage: pool add <name> <user@host> [--sudo]")
+            return 1
+        return cmd_add(pos[0], pos[1], sudo)
+
+    if verb == "rm":
+        if not rest:
+            print("usage: pool rm <name>")
+            return 1
+        return cmd_rm(rest[0])
+
+    if verb == "clean":
+        dry = "--dry-run" in rest
+        deep = "--deep" in rest
+        pos = [a for a in rest if a not in ("--dry-run", "--deep")]
+        if not pos:
+            print("usage: pool clean <name>|all [--dry-run] [--deep]")
+            return 1
+        return cmd_clean(pos, dry, deep)
+
+    if verb == "desc":
+        if not rest:
+            print("usage: pool desc <name> [text...]")
+            return 1
+        return cmd_desc(rest[0], " ".join(rest[1:]))
+
+    print(f"unknown verb: {verb}")
+    print(HELP)
+    return 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv))
+    except KeyboardInterrupt:
+        sys.exit(130)
